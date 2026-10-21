@@ -1,253 +1,70 @@
-
 import { randomUUID } from "node:crypto";
+import mongoose from "mongoose";
 import Event from "../models/Event";
 import { verifyWithProvider } from "../services/fakeProvider";
 import { applyJobProjection } from "../services/jobProjection";
 
-const LEASE_MS = 30_000;
 const MAX_ATTEMPTS = 3;
+const LEASE_MS = 30000;
+const RETRY_BASE_MS = Number(process.env.RETRY_BASE_MS ?? 2000);
+if (!Number.isFinite(RETRY_BASE_MS) || RETRY_BASE_MS <= 0) throw new Error("Invalid RETRY_BASE_MS");
 
-const RETRY_BASE_MS = Number(
-  process.env.RETRY_BASE_MS ?? 2000
-);
-
-if (!Number.isFinite(RETRY_BASE_MS) || RETRY_BASE_MS <= 0) {
-  throw new Error("RETRY_BASE_MS must be positive");
+export async function claimNextEvent() {
+  const now = new Date();
+  return Event.findOneAndUpdate({ $or: [
+    { status: "pending", nextAttemptAt: { $lte: now } },
+    { status: "processing", lockedUntil: { $lte: now } }
+  ] }, { $set: { status: "processing", lockedBy: randomUUID(), lockedUntil: new Date(now.getTime() + LEASE_MS) } },
+  { new: true, sort: { nextAttemptAt: 1, _id: 1 } });
 }
 
-// Claim an event atomically
-export const claimNextEvent = async () => {
-  const now = new Date();
-
-  const workerToken = randomUUID();
-
-  return Event.findOneAndUpdate(
-    {
-      $or: [
-        {
-          status: "pending",
-          nextAttemptAt: { $lte: now }
-        },
-        {
-          status: "processing",
-          lockedUntil: { $lte: now }
-        }
-      ]
-    },
-    {
-      $set: {
-        status: "processing",
-        lockedBy: workerToken,
-        lockedUntil: new Date(
-          now.getTime() + LEASE_MS
-        )
-      }
-    },
-    {
-      new: true,
-      sort: { nextAttemptAt: 1, _id: 1 }
-    }
-  );
-};
-
-// Process one claimed event
-export const processEvent = async (
-  event: NonNullable<
-    Awaited<ReturnType<typeof claimNextEvent>>
-  >
-): Promise<void> => {
-  const token = event.lockedBy;
-
-  if (!token) {
-    throw new Error("Claimed event has no lock token");
-  }
-
-  // All event updates must still own the lease
-  const ownedFilter = () => ({
-    _id: event._id,
-    status: "processing",
-    lockedBy: token,
-    lockedUntil: { $gt: new Date() }
-  });
-
-  // If the worker crashed after its third attempt,
-  // don't make a fourth provider call.
-  if (event.attempts >= MAX_ATTEMPTS) {
-    await Event.updateOne(ownedFilter(), {
-      $set: {
-        status: "failed",
-        lastError: event.lastError ??
-          "Maximum attempts reached"
-      },
-      $unset: {
-        lockedBy: "",
-        lockedUntil: ""
-      }
-    });
-
-    return;
-  }
-
-  const attempt = event.attempts + 1;
-
-  // Persist the attempt BEFORE calling the provider.
-  const started = await Event.updateOne(
-    ownedFilter(),
-    {
-      $set: { attempts: attempt },
-      $push: {
-        attemptHistory: {
-          attempt,
-          createdAt: new Date()
-        }
-      }
-    }
-  );
-
-  if (started.modifiedCount !== 1) {
-    console.log("Lease lost before verification");
-    return;
-  }
-
+type ClaimedEvent = NonNullable<Awaited<ReturnType<typeof claimNextEvent>>>;
+export async function processEvent(event: ClaimedEvent): Promise<void> {
+  const owned = () => ({ _id: event._id, status: "processing", lockedBy: event.lockedBy, lockedUntil: { $gt: new Date() } });
+  const fail = async (message: string, attempt: number, retry: boolean) => {
+    const update: Record<string, unknown> = { status: retry ? "pending" : "failed", lastError: message };
+    if (retry) update.nextAttemptAt = new Date(Date.now() + RETRY_BASE_MS * 2 ** (attempt - 1));
+    await Event.updateOne(owned(), { $set: update, $unset: { lockedBy: "", lockedUntil: "" } });
+    await Event.updateOne({ _id: event._id, "attemptHistory.attempt": attempt }, { $set: { "attemptHistory.$.error": message } });
+  };
   try {
-    const result = await verifyWithProvider(
-      event.eventId,
-      attempt
-    );
-
-    // Successful verification: leave processing until
-    // Step 10.3 applies the job projection safely.
- 
-if (result.success) {
-    // Verify that this worker still owns the event.
-    const owned = await Event.exists(ownedFilter());
-  
-    if (!owned) {
-      console.log("Lease lost before job update");
-      return;
-    }
-  
-    // Apply the job only if its version is newer.
-    const projectionResult = await applyJobProjection({
-      tenantId: event.tenantId,
-      sourceId: event.sourceId,
-      externalJobId: event.externalJobId,
-      version: event.version,
-      operation: event.operation,
-      payload: event.payload
-    });
-  
-    // Mark the event completed after the job update.
-    const acknowledged = await Event.updateOne(
-      ownedFilter(),
-      {
-        $set: {
-          status: "completed"
-        },
-        $unset: {
-          lockedBy: "",
-          lockedUntil: "",
-          lastError: ""
-        }
+    if (!event.providerVerified) {
+      if (event.attempts >= MAX_ATTEMPTS) {
+        await Event.updateOne(owned(), { $set: { status: "failed", lastError: event.lastError ?? "Attempt limit reached after worker interruption" }, $unset: { lockedBy: "", lockedUntil: "" } });
+        return;
       }
-    );
-  
-    if (acknowledged.modifiedCount !== 1) {
-      console.log(
-        "Job updated but event acknowledgement lost"
-      );
-      return;
-    }
-  
-    console.log(
-      `Event completed: ${event.eventId}, ${projectionResult}`
-    );
-  
-    return;
-  }  
-
-    const errorMessage = result.message;
-
-    const retryable =
-      result.statusCode === 429 ||
-      result.statusCode === 503;
-
-    const shouldRetry =
-      retryable && attempt < MAX_ATTEMPTS;
-
-    if (shouldRetry) {
-      const delay = RETRY_BASE_MS * 2 ** (attempt - 1);
-
-      await Event.updateOne(
-        ownedFilter(),
-        {
-          $set: {
-            status: "pending",
-            lastError: errorMessage,
-            nextAttemptAt: new Date(
-              Date.now() + delay
-            )
-          },
-          $unset: {
-            lockedBy: "",
-            lockedUntil: ""
-          },
-          $setOnInsert: {}
-        }
-      );
-
-      // Record the error in the matching attempt
-      await Event.updateOne(
-        {
-          _id: event._id,
-          "attemptHistory.attempt": attempt
-        },
-        {
-          $set: {
-            "attemptHistory.$.error": errorMessage
-          }
-        }
-      );
-
-      console.log(
-        `Retry scheduled: ${event.eventId}, attempt ${attempt}`
-      );
-
-      return;
-    }
-
-    // Permanent failure or retries exhausted
-    await Event.updateOne(
-      ownedFilter(),
-      {
-        $set: {
-          status: "failed",
-          lastError: errorMessage,
-          "attemptHistory.$[entry].error": errorMessage
-        },
-        $unset: {
-          lockedBy: "",
-          lockedUntil: ""
-        }
-      },
-      {
-        arrayFilters: [
-          { "entry.attempt": attempt }
-        ]
+      const attempt = event.attempts + 1;
+      const recorded = await Event.updateOne(owned(), { $set: { attempts: attempt }, $push: { attemptHistory: { attempt, createdAt: new Date() } } });
+      if (recorded.modifiedCount !== 1) return;
+      let result;
+      try { result = await verifyWithProvider(event.eventId, attempt); }
+      catch (error) { await fail(String(error), attempt, attempt < MAX_ATTEMPTS); return; }
+      if (!result.success) {
+        await fail(result.message, attempt, (result.statusCode === 429 || result.statusCode === 503) && attempt < MAX_ATTEMPTS);
+        return;
       }
-    );
-
-    console.log(
-      `Event failed: ${event.eventId}, HTTP ${result.statusCode}`
-    );
-
+      const verified = await Event.updateOne(owned(), { $set: { providerVerified: true } });
+      if (verified.modifiedCount !== 1) return;
+    }
+    // A single transaction makes projection and acknowledgement atomic.
+    // Retry the entire transaction on transient write conflicts.
+    for (let retry = 0; retry < 5; retry++) {
+      try {
+        await mongoose.connection.transaction(async session => {
+          const acknowledged = await Event.updateOne(owned(), { $set: { status: "completed" }, $unset: { lockedBy: "", lockedUntil: "", lastError: "" } }, { session });
+          if (acknowledged.modifiedCount !== 1) throw new Error("Lease ownership lost");
+          await applyJobProjection({ tenantId: event.tenantId, sourceId: event.sourceId, externalJobId: event.externalJobId, version: event.version, operation: event.operation, payload: event.payload }, session);
+        });
+        return;
+      } catch (error: unknown) {
+        const e = error as { code?: number; hasErrorLabel?: (label: string) => boolean; message?: string };
+        if (e.message === "Lease ownership lost") return;
+        if (retry === 4 || !(e.code === 11000 || e.code === 112 || e.hasErrorLabel?.("TransientTransactionError"))) throw error;
+        await new Promise(resolve => setTimeout(resolve, 30 * (retry + 1)));
+      }
+    }
   } catch (error) {
-    // Unexpected provider errors must not be treated
-    // as a successful verification.
-    console.error("Provider processing error:", error);
-
-    // Keep the event processing so its lease expires.
-    // A later worker can recover it. Its attempt was
-    // already counted, preventing unlimited retries.
+    // Keep verified work recoverable; lease expiry allows a new claim.
+    console.error("Worker error (will recover after lease):", error);
   }
-};
+}

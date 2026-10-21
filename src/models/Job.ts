@@ -57,6 +57,8 @@ const jobSchema = new Schema<IJob>(
   { timestamps: true }
 );
 
+jobSchema.index({ tenantId: 1, sourceId: 1, externalJobId: 1 }, { unique: true, name: "unique_job_identity" });
+
 // Only one record per logical job
 jobSchema.index({
   tenantId: 1,

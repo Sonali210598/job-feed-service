@@ -9,6 +9,8 @@ import connectDB from "./config/db";
 import swaggerSpec from "./config/swagger";
 import eventRoutes from "./routes/eventRoutes";
 import jobRoutes from "./routes/jobRoutes";
+import Job from "./models/Job";
+import { startWorkers } from "./workers/startWorker";
 
 dotenv.config();
 
@@ -47,6 +49,8 @@ const startServer = async () => {
   // Ensure unique indexes exist before accepting requests
   const Event = (await import("./models/Event")).default;
   await Event.init();
+  await Job.init();
+  startWorkers();
 
   app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);

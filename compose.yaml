@@ -29,7 +29,7 @@ services:
         condition: service_completed_successfully
     environment:
       PORT: "5000"
-      MONGO_URI: "mongodb://mongo:27017/job_feed_db?replicaSet=rs0"
+      MONGO_URI: "mongodb://mongo:27017/job_feed_db?replicaSet=rs0&directConnection=true"
       RETRY_BASE_MS: "2000"
     ports:
       - "5000:5000"

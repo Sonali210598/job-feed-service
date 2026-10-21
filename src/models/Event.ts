@@ -34,6 +34,7 @@ export interface IEvent  {
   lastError?: string;
   nextAttemptAt: Date;
 
+  providerVerified?: boolean;
   lockedBy?: string;
   lockedUntil?: Date;
 }
@@ -100,6 +101,7 @@ const eventSchema = new Schema<IEvent>(
       default: Date.now
     },
 
+    providerVerified: { type: Boolean, default: false },
     lockedBy: String,
     lockedUntil: Date
   },

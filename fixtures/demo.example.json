@@ -1,0 +1,13 @@
+{
+  "_note": "Example of wrapper format only. NOT the supplied 20-request assignment fixture. Replace with actual supplied data.",
+  "phase1": [
+    { "body": { "tenantId": "demo-a", "sourceId": "main", "eventId": "sample-1", "externalJobId": "sample-job", "version": 1, "operation": "archive" }, "expectedStatus": 202 }
+  ],
+  "phase2": [],
+  "expectedEvents": [
+    { "tenantId": "demo-a", "sourceId": "main", "eventId": "sample-1", "status": "completed", "attempts": 1 }
+  ],
+  "expectedJobs": [
+    { "tenantId": "demo-a", "sourceId": "main", "externalJobId": "sample-job", "version": 1, "status": "archived" }
+  ]
+}

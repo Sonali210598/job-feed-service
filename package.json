@@ -7,7 +7,9 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "demo": "tsx scripts/demo.ts",
+    "load": "tsx scripts/load.ts"
   },
   "repository": {
     "type": "git",

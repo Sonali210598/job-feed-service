@@ -1,5 +1,6 @@
 
 import Job from "../models/Job";
+import type { ClientSession } from "mongoose";
 
 interface ProjectionEvent {
   tenantId: string;
@@ -19,7 +20,8 @@ interface ProjectionEvent {
 }
 
 export const applyJobProjection = async (
-  event: ProjectionEvent
+  event: ProjectionEvent,
+  session?: ClientSession
 ): Promise<"applied" | "stale"> => {
   const identity = {
     tenantId: event.tenantId,
@@ -59,7 +61,8 @@ export const applyJobProjection = async (
     },
     {
       $set: update
-    }
+    },
+    { session }
   );
 
   if (updated.modifiedCount === 1) {
@@ -69,6 +72,7 @@ export const applyJobProjection = async (
   // Check whether the job already exists
   const existing = await Job.findOne(identity)
     .select("version")
+    .session(session ?? null)
     .lean();
 
   if (existing) {
@@ -77,10 +81,10 @@ export const applyJobProjection = async (
 
   // No job exists: create one
   try {
-    await Job.create({
+    await Job.create([{
       ...identity,
       ...update
-    });
+    }], { session });
 
     return "applied";
   } catch (error: unknown) {
@@ -93,6 +97,7 @@ export const applyJobProjection = async (
     ) {
       // Retry the conditional update in case the
       // other worker inserted a lower version.
+      if (session) throw error; // Retry the whole transaction.
       const retry = await Job.updateOne(
         {
           ...identity,
